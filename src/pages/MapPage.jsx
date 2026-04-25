@@ -22,8 +22,20 @@ const SEED_LISTINGS = [
     pickupStart: '19:00', pickupEnd: '21:00', status: 'claimed' },
 ]
 
+function toTimeString(val) {
+  if (!val) return ''
+  if (typeof val === 'string') return val
+  // Firestore Timestamp
+  if (val.toDate) {
+    const d = val.toDate()
+    return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`
+  }
+  return String(val)
+}
+
 function getPinStyle(status, pickupEnd) {
   if (status === 'claimed') return { bg: 'bg-stone-400', label: 'Claimed', color: '#9ca3af' }
+  if (!pickupEnd || typeof pickupEnd !== 'string') return { bg: 'bg-green-600', label: 'Available', color: '#16a34a' }
   const [h, m] = pickupEnd.split(':').map(Number)
   const endMin = h * 60 + m
   const now = new Date()
@@ -42,7 +54,16 @@ export default function MapPage() {
   useEffect(() => {
     const q = query(collection(db, 'listings'))
     const unsub = onSnapshot(q, snap => {
-      const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+      const docs = snap.docs.map(d => {
+        const data = d.data()
+        return {
+          id: d.id,
+          ...data,
+          pickupStart: toTimeString(data.pickupStart),
+          pickupEnd: toTimeString(data.pickupEnd),
+          createdAt: undefined,
+        }
+      })
       setListings(docs.length > 0 ? docs : SEED_LISTINGS)
     })
     return () => unsub()
@@ -56,22 +77,34 @@ export default function MapPage() {
       center: [-74.006, 40.7128],
       zoom: 12,
     })
+    return () => {
+      mapRef.current?.remove()
+      mapRef.current = null
+    }
   }, [])
 
   useEffect(() => {
     if (!mapRef.current) return
-    markersRef.current.forEach(m => m.remove())
-    markersRef.current = listings
-      .filter(l => l.lat && l.lng)
-      .map(listing => {
-        const { color } = getPinStyle(listing.status, listing.pickupEnd)
-        const el = document.createElement('div')
-        el.style.cssText = `width:14px;height:14px;border-radius:50%;background:${color};border:2px solid white;box-shadow:0 2px 6px rgba(0,0,0,.3);cursor:pointer`
-        el.addEventListener('click', () => setSelected(listing))
-        return new mapboxgl.Marker({ element: el })
-          .setLngLat([listing.lng, listing.lat])
-          .addTo(mapRef.current)
-      })
+    const addMarkers = () => {
+      markersRef.current.forEach(m => m.remove())
+      markersRef.current = listings
+        .filter(l => l.lat && l.lng)
+        .map(listing => {
+          const { color } = getPinStyle(listing.status, listing.pickupEnd)
+          const el = document.createElement('div')
+          el.style.cssText = `width:14px;height:14px;border-radius:50%;background:${color};border:2px solid white;box-shadow:0 2px 6px rgba(0,0,0,.3);cursor:pointer`
+          el.addEventListener('click', () => setSelected(listing))
+          return new mapboxgl.Marker({ element: el })
+            .setLngLat([listing.lng, listing.lat])
+            .addTo(mapRef.current)
+        })
+    }
+    if (mapRef.current.loaded()) {
+      addMarkers()
+    } else {
+      mapRef.current.on('load', addMarkers)
+      return () => mapRef.current?.off('load', addMarkers)
+    }
   }, [listings])
 
   const handleClaim = async (id) => {
