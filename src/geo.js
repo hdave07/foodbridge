@@ -1,3 +1,14 @@
+import { NYC_SHELTERS } from './data/shelters.js'
+
+export function assignNearestShelter(listing) {
+  if (!listing.lat || !listing.lng) return NYC_SHELTERS[0]
+  return NYC_SHELTERS.reduce((nearest, shelter) => {
+    const d = haversineDistance(listing.lat, listing.lng, shelter.lat, shelter.lng)
+    const dNearest = haversineDistance(listing.lat, listing.lng, nearest.lat, nearest.lng)
+    return d < dNearest ? shelter : nearest
+  })
+}
+
 export function getVolunteerLocation() {
   return new Promise((resolve, reject) => {
     if (!navigator.geolocation) {

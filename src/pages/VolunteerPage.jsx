@@ -2,16 +2,18 @@ import { useState, useEffect } from 'react'
 import { db, storage } from '../firebase'
 import { collection, query, onSnapshot, addDoc, updateDoc, doc, serverTimestamp, orderBy } from 'firebase/firestore'
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage'
-import { getVolunteerLocation, haversineDistance } from '../geo'
+import { getVolunteerLocation, haversineDistance, assignNearestShelter } from '../geo'
 import { getRouteOrder, verifyPhoto } from '../claude'
 
 const FOOD_EMOJI = { 'Noodles':'🍜', 'Cooked meals':'🍱', 'Bread & bakery':'🥖', 'Dim sum':'🥟', 'Drinks':'🧃' }
 
-const IMPACT = [
-  { num: '143', label: 'Meals rescued',    delta: '↑ 3× last Saturday' },
-  { num: '7',   label: 'Pickups done',     delta: 'Top 12% this week'  },
-  { num: '4',   label: 'Partners thanked', delta: 'Via Claude drafts'  },
-]
+const BOROUGH_COORDS = {
+  'Manhattan':     { lat: 40.7831, lng: -73.9712 },
+  'Brooklyn':      { lat: 40.6782, lng: -73.9442 },
+  'Queens':        { lat: 40.7282, lng: -73.7949 },
+  'Bronx':         { lat: 40.8448, lng: -73.8648 },
+  'Staten Island': { lat: 40.5795, lng: -74.1502 },
+}
 
 function formatTime(val) {
   if (!val) return '—'
@@ -21,13 +23,14 @@ function formatTime(val) {
 }
 
 export default function VolunteerPage() {
-  const [form, setForm] = useState({ name: '', phone: '', district: '', availability: '', transport: '' })
+  const [form, setForm] = useState({ name: '', phone: '' })
+  const [locStatus, setLocStatus] = useState('idle') // idle | loading | found | error
   const [pledged, setPledged] = useState(false)
   const [pledgeError, setPledgeError] = useState(false)
   const [registered, setRegistered] = useState(false)
 
   const [listings, setListings] = useState([])
-  const [claimed, setClaimed] = useState({}) // IDs claimed this session
+  const [claimed, setClaimed] = useState({})
 
   const [volunteerLocation, setVolunteerLocation] = useState(null)
   const [route, setRoute] = useState(null)
@@ -43,9 +46,20 @@ export default function VolunteerPage() {
   const FLAG_THRESHOLD = 3
   const isLocked = flagCount >= FLAG_THRESHOLD
 
-  // Listings claimed this session that are still in 'claimed' status in Firestore
   const sessionClaimedListings = listings.filter(l => claimed[l.id] && l.status === 'claimed')
   const sessionClaimedIds = sessionClaimedListings.map(l => l.id)
+  const verifyTarget = sessionClaimedListings[0] || null
+
+  const sortedListings = volunteerLocation
+    ? [...listings].sort((a, b) => {
+        if (a.status === 'open' && b.status !== 'open') return -1
+        if (a.status !== 'open' && b.status === 'open') return 1
+        if (!a.lat || !a.lng) return 1
+        if (!b.lat || !b.lng) return -1
+        return haversineDistance(volunteerLocation.lat, volunteerLocation.lng, a.lat, a.lng)
+             - haversineDistance(volunteerLocation.lat, volunteerLocation.lng, b.lat, b.lng)
+      })
+    : listings
 
   useEffect(() => {
     const q = query(collection(db, 'listings'), orderBy('createdAt', 'desc'))
@@ -53,10 +67,6 @@ export default function VolunteerPage() {
       setListings(snap.docs.map(d => ({ id: d.id, ...d.data() })))
     })
     return () => unsub()
-  }, [])
-
-  useEffect(() => {
-    getVolunteerLocation().then(setVolunteerLocation).catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -74,6 +84,27 @@ export default function VolunteerPage() {
     setForm({ ...form, [e.target.name]: e.target.value })
   }
 
+  async function handleGetLocation() {
+    setLocStatus('loading')
+    try {
+      const loc = await getVolunteerLocation()
+      setVolunteerLocation(loc)
+      setLocStatus('found')
+    } catch {
+      setLocStatus('error')
+    }
+  }
+
+  function handleBoroughFallback(e) {
+    const borough = e.target.value
+    if (!borough) return
+    const coords = BOROUGH_COORDS[borough]
+    if (coords) {
+      setVolunteerLocation(coords)
+      setLocStatus('found')
+    }
+  }
+
   async function handleSubmit() {
     if (!form.name.trim()) return
     if (!pledged) {
@@ -81,15 +112,31 @@ export default function VolunteerPage() {
       setTimeout(() => setPledgeError(false), 1800)
       return
     }
-    await addDoc(collection(db, 'volunteers'), { ...form, pledged: true, createdAt: serverTimestamp() })
+    await addDoc(collection(db, 'volunteers'), {
+      name: form.name,
+      phone: form.phone,
+      lat: volunteerLocation?.lat ?? null,
+      lng: volunteerLocation?.lng ?? null,
+      pledged: true,
+      createdAt: serverTimestamp(),
+    })
     setRegistered(true)
   }
 
-  async function handleClaim(id) {
-    setClaimed(prev => ({ ...prev, [id]: true }))
-    await updateDoc(doc(db, 'listings', id), {
+  async function handleClaim(listing) {
+    const shelter = assignNearestShelter(listing)
+    setClaimed(prev => ({ ...prev, [listing.id]: true }))
+    await updateDoc(doc(db, 'listings', listing.id), {
       status: 'claimed',
       claimedBy: form.name || 'volunteer',
+      claimedByLat: volunteerLocation?.lat ?? null,
+      claimedByLng: volunteerLocation?.lng ?? null,
+      dropOffId: shelter.id,
+      dropOffName: shelter.name,
+      dropOffAddress: shelter.address,
+      dropOffLat: shelter.lat,
+      dropOffLng: shelter.lng,
+      dropOffEIN: shelter.ein,
     })
   }
 
@@ -109,32 +156,30 @@ export default function VolunteerPage() {
     setVerifying(true)
     setVerifyResult(null)
     try {
-      // Upload to Firebase Storage
       const storageRef = ref(storage, `deliveries/${Date.now()}_${photos[0].name}`)
       await uploadBytes(storageRef, photos[0])
       const photoUrl = await getDownloadURL(storageRef)
 
-      // Verify with Claude Vision
       const base64 = await toBase64(photos[0])
       const { verified, flagged, reason } = await verifyPhoto(base64)
 
-      if (!verified) {
-        setFlagCount(prev => prev + 1)
-      }
+      if (!verified) setFlagCount(prev => prev + 1)
 
-      // Mark the first session-claimed listing as completed
-      const targetId = sessionClaimedIds[0]
-      if (targetId) {
-        await updateDoc(doc(db, 'listings', targetId), {
+      if (verifyTarget) {
+        await updateDoc(doc(db, 'listings', verifyTarget.id), {
           status: 'completed',
           photoUrl,
           aiVerified: verified,
           aiFlagged: flagged ?? false,
           aiReason: reason,
+          completedAt: serverTimestamp(),
         })
       }
 
-      setVerifyResult({ ok: verified, text: verified ? `Delivery verified — ${reason}` : `Could not verify — ${reason}` })
+      setVerifyResult({
+        ok: verified,
+        text: verified ? `Delivery verified — ${reason}` : `Could not verify — ${reason}`,
+      })
     } catch (err) {
       setVerifyResult({ ok: false, text: `Error: ${err.message}` })
     } finally {
@@ -186,28 +231,32 @@ export default function VolunteerPage() {
                   <label className="block text-xs text-stone-500 mb-1">WhatsApp number</label>
                   <input name="phone" value={form.phone} onChange={handleInput} placeholder="+1 212 555 0123" type="tel" className={inputClass} />
                 </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <div>
-                    <label className="block text-xs text-stone-500 mb-1">District</label>
-                    <select name="district" value={form.district} onChange={handleInput} className={inputClass}>
-                      <option value="">Select…</option>
-                      {['East Village', 'Lower East Side', "Hell's Kitchen", 'Midtown', 'Brooklyn', 'Harlem'].map(d => <option key={d}>{d}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-xs text-stone-500 mb-1">Availability</label>
-                    <select name="availability" value={form.availability} onChange={handleInput} className={inputClass}>
-                      <option value="">Select…</option>
-                      {['Evenings (5–9pm)', 'Weekends', 'Flexible'].map(a => <option key={a}>{a}</option>)}
-                    </select>
-                  </div>
-                </div>
+
                 <div>
-                  <label className="block text-xs text-stone-500 mb-1">Transport</label>
-                  <select name="transport" value={form.transport} onChange={handleInput} className={inputClass}>
-                    <option value="">Select…</option>
-                    {['On foot', 'Bicycle / e-bike', 'Motorcycle', 'Car / van', 'Public transit'].map(t => <option key={t}>{t}</option>)}
-                  </select>
+                  <label className="block text-xs text-stone-500 mb-1.5">Your location</label>
+                  <button
+                    type="button"
+                    onClick={handleGetLocation}
+                    disabled={locStatus === 'loading'}
+                    className={`w-full py-2 rounded-lg text-sm font-medium border transition flex items-center justify-center gap-2 ${
+                      locStatus === 'found'
+                        ? 'bg-green-50 border-green-300 text-green-700'
+                        : 'bg-stone-50 border-stone-200 text-stone-600 hover:bg-stone-100'
+                    }`}
+                  >
+                    {locStatus === 'loading' ? 'Getting location…' : locStatus === 'found' ? '📍 Location found' : '📍 Use my location'}
+                  </button>
+                  {(locStatus === 'error' || locStatus === 'idle') && (
+                    <>
+                      {locStatus === 'error' && (
+                        <p className="text-xs text-stone-400 mt-1.5">GPS unavailable. Select your borough:</p>
+                      )}
+                      <select onChange={handleBoroughFallback} defaultValue="" className={`${inputClass} mt-1.5`}>
+                        <option value="">Borough fallback…</option>
+                        {Object.keys(BOROUGH_COORDS).map(b => <option key={b}>{b}</option>)}
+                      </select>
+                    </>
+                  )}
                 </div>
 
                 <div className={`rounded-xl p-3 flex gap-2.5 items-start border transition ${pledgeError ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200'}`}>
@@ -230,9 +279,15 @@ export default function VolunteerPage() {
             <p className="text-xs font-semibold text-stone-400 uppercase tracking-widest mb-3 pb-3 border-b border-stone-100">
               Upload delivery photos
             </p>
-            <p className="text-xs text-stone-500 leading-relaxed mb-3">
-              After a pickup, upload a photo so Claude Vision can verify the delivery and log it to the impact dashboard.
-            </p>
+
+            {verifyTarget && (
+              <div className="text-xs text-stone-500 bg-stone-50 rounded-lg px-3 py-2 mb-3 border border-stone-100 leading-relaxed">
+                Verifying for: <span className="font-semibold text-stone-700">{verifyTarget.restaurantName}</span>
+                {verifyTarget.dropOffName && (
+                  <> → <span className="font-semibold text-stone-700">{verifyTarget.dropOffName}</span></>
+                )}
+              </div>
+            )}
 
             {photos.length === 0 ? (
               <label className="block border-2 border-dashed border-stone-200 rounded-xl p-6 text-center cursor-pointer hover:bg-stone-50 hover:border-green-400 transition">
@@ -300,18 +355,28 @@ export default function VolunteerPage() {
             )}
 
             <div className="space-y-3">
-              {listings.map(l => {
+              {sortedListings.map(l => {
+                const isMyClaim = !!claimed[l.id]
                 const isClaimed = l.status === 'claimed'
                 const isCompleted = l.status === 'completed'
+                const distMi = volunteerLocation && l.lat && l.lng
+                  ? haversineDistance(volunteerLocation.lat, volunteerLocation.lng, l.lat, l.lng)
+                  : null
+
                 return (
-                  <div key={l.id} className={`border rounded-xl p-3.5 transition ${isCompleted || isClaimed ? 'opacity-60 border-stone-100' : 'border-stone-200 hover:border-green-300 hover:bg-green-50/30'}`}>
+                  <div key={l.id} className={`border rounded-xl p-3.5 transition ${
+                    isCompleted ? 'opacity-50 border-stone-100' :
+                    isClaimed && !isMyClaim ? 'opacity-50 border-stone-100' :
+                    isMyClaim ? 'border-green-300 bg-green-50/30' :
+                    'border-stone-200 hover:border-green-300 hover:bg-green-50/30'
+                  }`}>
                     <div className="flex items-start gap-3 mb-2.5">
                       <div className="w-9 h-9 rounded-lg bg-stone-100 flex items-center justify-center text-lg flex-shrink-0">
                         {FOOD_EMOJI[l.foodType] || '🍽️'}
                       </div>
                       <div className="flex-1 min-w-0">
                         <p className="text-sm font-semibold text-stone-800 truncate">{l.restaurantName}</p>
-                        <p className="text-xs text-stone-500">{l.address}</p>
+                        <p className="text-xs text-stone-500 truncate">{l.address}</p>
                       </div>
                       {isCompleted && (
                         <span className={`flex-shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${l.aiVerified ? 'bg-green-100 text-green-800 border-green-300' : 'bg-stone-100 text-stone-500 border-stone-200'}`}>
@@ -323,9 +388,9 @@ export default function VolunteerPage() {
                     <div className="flex flex-wrap gap-1.5 mb-2.5">
                       <span className="text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-800 border border-green-200">{l.foodType}</span>
                       <span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200">{l.quantity} portions</span>
-                      {volunteerLocation && l.lat && l.lng && (
+                      {distMi !== null && (
                         <span className="text-xs px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 border border-blue-200">
-                          {haversineDistance(volunteerLocation.lat, volunteerLocation.lng, l.lat, l.lng).toFixed(1)} mi away
+                          {distMi.toFixed(1)} mi
                         </span>
                       )}
                     </div>
@@ -334,18 +399,51 @@ export default function VolunteerPage() {
                       <p className="text-xs text-stone-400">
                         Pickup <span className="text-stone-600">{formatTime(l.pickupStart)}–{formatTime(l.pickupEnd)}</span>
                       </p>
-                      {isCompleted || isClaimed
-                        ? <span className="text-xs font-medium text-green-600">{isCompleted ? 'Completed ✓' : 'Claimed ✓'}</span>
-                        : isLocked
-                          ? <span className="text-xs font-medium text-red-400">Account locked</span>
-                          : (
-                            <button onClick={() => handleClaim(l.id)}
-                              className="text-xs font-medium text-green-700 border border-green-600 px-3 py-1 rounded-full hover:bg-green-600 hover:text-white transition">
-                              Claim pickup
-                            </button>
-                          )
+                      {isCompleted
+                        ? <span className="text-xs font-medium text-stone-400">Completed ✓</span>
+                        : isClaimed && !isMyClaim
+                          ? <span className="text-xs font-medium text-stone-400">Claimed</span>
+                          : isMyClaim
+                            ? <span className="text-xs font-medium text-green-600">Claimed by you ✓</span>
+                            : isLocked
+                              ? <span className="text-xs font-medium text-red-400">Account locked</span>
+                              : (
+                                <button onClick={() => handleClaim(l)}
+                                  className="text-xs font-medium text-green-700 border border-green-600 px-3 py-1 rounded-full hover:bg-green-600 hover:text-white transition">
+                                  Claim pickup
+                                </button>
+                              )
                       }
                     </div>
+
+                    {/* Expanded info for volunteer's own claimed listings */}
+                    {isMyClaim && l.dropOffName && (
+                      <div className="mt-2.5 pt-2.5 border-t border-stone-100 space-y-2">
+                        <div className="flex items-start gap-2">
+                          <span className="text-[11px] text-stone-400 w-14 flex-shrink-0 pt-0.5">Pick up</span>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-xs text-stone-700 leading-snug">{l.address}</p>
+                            <a
+                              href={`https://maps.google.com/?q=${encodeURIComponent(l.address)}`}
+                              target="_blank" rel="noopener noreferrer"
+                              className="text-[11px] text-green-600 hover:underline"
+                            >Open in Maps ↗</a>
+                          </div>
+                        </div>
+                        <div className="flex items-start gap-2">
+                          <span className="text-[11px] text-stone-400 w-14 flex-shrink-0 pt-0.5">Drop off</span>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-xs font-medium text-stone-700">{l.dropOffName}</p>
+                            <p className="text-xs text-stone-500 leading-snug">{l.dropOffAddress}</p>
+                            <a
+                              href={`https://maps.google.com/?q=${encodeURIComponent(l.dropOffAddress)}`}
+                              target="_blank" rel="noopener noreferrer"
+                              className="text-[11px] text-green-600 hover:underline"
+                            >Open in Maps ↗</a>
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )
               })}
@@ -366,7 +464,7 @@ export default function VolunteerPage() {
                 <div className="space-y-2">
                   {orderedClaimedListings.map((l, i) => (
                     <div key={l.id} className="flex items-center gap-2">
-                      <span className={`text-xs font-medium px-2.5 py-1 rounded-full ${i === 0 ? 'bg-green-100 text-green-800' : i === 1 ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-800'}`}>
+                      <span className={`text-xs font-medium px-2.5 py-1 rounded-full flex-shrink-0 ${i === 0 ? 'bg-green-100 text-green-800' : i === 1 ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-800'}`}>
                         Stop {i + 1}
                       </span>
                       <span className="text-sm font-medium text-stone-800 truncate">{l.restaurantName}, {l.address?.split(',')[1]?.trim() || l.address}</span>
@@ -389,7 +487,11 @@ export default function VolunteerPage() {
               Your impact
             </p>
             <div className="grid grid-cols-3 gap-3">
-              {IMPACT.map(s => (
+              {[
+                { num: '143', label: 'Meals rescued',    delta: '↑ 3× last Saturday' },
+                { num: '7',   label: 'Pickups done',     delta: 'Top 12% this week'  },
+                { num: '4',   label: 'Partners thanked', delta: 'Via Claude drafts'  },
+              ].map(s => (
                 <div key={s.label} className="bg-stone-50 rounded-xl p-3 text-center">
                   <p className="text-2xl font-bold text-stone-800" style={{ fontFamily: 'Georgia, serif' }}>{s.num}</p>
                   <p className="text-xs text-stone-500 mt-1">{s.label}</p>
