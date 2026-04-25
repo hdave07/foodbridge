@@ -2,7 +2,6 @@ import { haversineDistance } from './geo.js'
 
 export async function getRouteOrder(volunteerLat, volunteerLng, listings) {
   const enriched = listings
-    .filter(l => l.status === 'open')
     .map(l => ({
       id: l.id,
       restaurantName: l.restaurantName,

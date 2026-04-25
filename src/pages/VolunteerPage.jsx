@@ -1,13 +1,11 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
+import { db, storage } from '../firebase'
+import { collection, query, onSnapshot, addDoc, updateDoc, doc, serverTimestamp, orderBy } from 'firebase/firestore'
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage'
+import { getVolunteerLocation, haversineDistance } from '../geo'
+import { getRouteOrder, verifyPhoto } from '../claude'
 
-const LISTINGS = [
-  { id: 'lc1', emoji: '🥟', name: 'Dim Sum Palace', district: 'Wan Chai',
-    type: 'Dim sum / Cantonese', boxes: 35, distance: '0.8 km', window: '6–8 PM', expires: '7:00 PM' },
-  { id: 'lc2', emoji: '🍱', name: 'Bento Garden', district: 'Central',
-    type: 'Japanese bento', boxes: 40, distance: '2.1 km', window: '6–8 PM', expires: '8:00 PM' },
-  { id: 'lc3', emoji: '🍕', name: 'Mama Mia Pizzeria', district: 'TST',
-    type: 'Pizza / Italian', boxes: 18, distance: '3.4 km', window: '7–9 PM', expires: '9:00 PM' },
-]
+const FOOD_EMOJI = { 'Noodles':'🍜', 'Cooked meals':'🍱', 'Bread & bakery':'🥖', 'Dim sum':'🥟', 'Drinks':'🧃' }
 
 const IMPACT = [
   { num: '143', label: 'Meals rescued',    delta: '↑ 3× last Saturday' },
@@ -15,36 +13,80 @@ const IMPACT = [
   { num: '4',   label: 'Partners thanked', delta: 'Via Claude drafts'  },
 ]
 
+function formatTime(val) {
+  if (!val) return '—'
+  if (typeof val === 'string') return val
+  if (val?.toDate) return val.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  return String(val)
+}
+
 export default function VolunteerPage() {
   const [form, setForm] = useState({ name: '', phone: '', district: '', availability: '', transport: '' })
   const [pledged, setPledged] = useState(false)
   const [pledgeError, setPledgeError] = useState(false)
   const [registered, setRegistered] = useState(false)
-  const [claimed, setClaimed] = useState({})
+
+  const [listings, setListings] = useState([])
+  const [claimed, setClaimed] = useState({}) // IDs claimed this session
+
+  const [volunteerLocation, setVolunteerLocation] = useState(null)
+  const [route, setRoute] = useState(null)
+  const [routeReason, setRouteReason] = useState('')
+  const [routeLoading, setRouteLoading] = useState(false)
+  const [routeError, setRouteError] = useState('')
+
   const [photos, setPhotos] = useState([])
   const [verifying, setVerifying] = useState(false)
   const [verifyResult, setVerifyResult] = useState(null)
 
-  const claimedCount = Object.values(claimed).filter(Boolean).length
+  // Listings claimed this session that are still in 'claimed' status in Firestore
+  const sessionClaimedListings = listings.filter(l => claimed[l.id] && l.status === 'claimed')
+  const sessionClaimedIds = sessionClaimedListings.map(l => l.id)
+
+  useEffect(() => {
+    const q = query(collection(db, 'listings'), orderBy('createdAt', 'desc'))
+    const unsub = onSnapshot(q, snap => {
+      setListings(snap.docs.map(d => ({ id: d.id, ...d.data() })))
+    })
+    return () => unsub()
+  }, [])
+
+  useEffect(() => {
+    getVolunteerLocation().then(setVolunteerLocation).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    if (sessionClaimedIds.length < 2) { setRoute(null); setRouteReason(''); return }
+    if (!volunteerLocation) return
+    setRouteLoading(true)
+    setRouteError('')
+    getRouteOrder(volunteerLocation.lat, volunteerLocation.lng, sessionClaimedListings)
+      .then(({ order, reason }) => { setRoute(order); setRouteReason(reason) })
+      .catch(err => setRouteError(err.message))
+      .finally(() => setRouteLoading(false))
+  }, [sessionClaimedIds.join(','), volunteerLocation])
 
   function handleInput(e) {
     setForm({ ...form, [e.target.name]: e.target.value })
   }
 
-  function handleSubmit() {
+  async function handleSubmit() {
     if (!form.name.trim()) return
     if (!pledged) {
       setPledgeError(true)
       setTimeout(() => setPledgeError(false), 1800)
       return
     }
+    await addDoc(collection(db, 'volunteers'), { ...form, pledged: true, createdAt: serverTimestamp() })
     setRegistered(true)
-    // 🔌 FIREBASE: addDoc(collection(db, 'volunteers'), { ...form, pledged: true, createdAt: serverTimestamp() })
   }
 
-  function handleClaim(id) {
+  async function handleClaim(id) {
     setClaimed(prev => ({ ...prev, [id]: true }))
-    // 🔌 FIREBASE: updateDoc(doc(db, 'listings', id), { status: 'claimed', claimedBy: volunteerId })
+    await updateDoc(doc(db, 'listings', id), {
+      status: 'claimed',
+      claimedBy: form.name || 'volunteer',
+    })
   }
 
   function handleFiles(e) {
@@ -58,23 +100,59 @@ export default function VolunteerPage() {
     setVerifyResult(null)
   }
 
-  function handleVerify() {
+  async function handleVerify() {
+    if (!photos[0]) return
     setVerifying(true)
     setVerifyResult(null)
-    // 🔌 CLAUDE VISION: real API call goes here
-    // const base64 = await toBase64(photos[0])
-    // const res = await fetch('/api/verify', { method: 'POST', body: JSON.stringify({ image: base64 }) })
-    setTimeout(() => {
+    try {
+      // Upload to Firebase Storage
+      const storageRef = ref(storage, `deliveries/${Date.now()}_${photos[0].name}`)
+      await uploadBytes(storageRef, photos[0])
+      const photoUrl = await getDownloadURL(storageRef)
+
+      // Verify with Claude Vision
+      const base64 = await toBase64(photos[0])
+      const { verified, reason } = await verifyPhoto(base64)
+
+      // Mark the first session-claimed listing as completed
+      const targetId = sessionClaimedIds[0]
+      if (targetId) {
+        await updateDoc(doc(db, 'listings', targetId), {
+          status: 'completed',
+          photoUrl,
+          aiVerified: verified,
+          aiReason: reason,
+        })
+      }
+
+      setVerifyResult({ ok: verified, text: verified ? `Delivery verified — ${reason}` : `Could not verify — ${reason}` })
+    } catch (err) {
+      setVerifyResult({ ok: false, text: `Error: ${err.message}` })
+    } finally {
       setVerifying(false)
-      setVerifyResult('Distribution verified — Claude Vision detected food containers in a public outdoor setting. Pickup logged: 35 boxes, Wan Chai → Sham Shui Po. Impact dashboard updated.')
-    }, 1800)
+    }
   }
+
+  function toBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(reader.result.split(',')[1])
+      reader.onerror = reject
+      reader.readAsDataURL(file)
+    })
+  }
+
+  const orderedClaimedListings = route
+    ? route.map(id => sessionClaimedListings.find(l => l.id === id)).filter(Boolean)
+    : sessionClaimedListings
+
+  const inputClass = 'w-full px-3 py-2 border border-stone-200 rounded-lg text-sm text-stone-800 placeholder-stone-400 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition'
 
   return (
     <div className="min-h-screen bg-stone-50">
       <div className="max-w-5xl mx-auto px-4 py-8 grid grid-cols-1 md:grid-cols-[340px_1fr] gap-5 items-start">
 
-        {/* ── LEFT COLUMN ── */}
+        {/* LEFT COLUMN */}
         <div className="space-y-4">
 
           {/* Registration card */}
@@ -93,33 +171,23 @@ export default function VolunteerPage() {
               <div className="space-y-3">
                 <div>
                   <label className="block text-xs text-stone-500 mb-1">Full name</label>
-                  <input
-                    name="name" value={form.name} onChange={handleInput}
-                    placeholder="Jane Smith" required
-                    className="w-full px-3 py-2 border border-stone-200 rounded-lg text-sm text-stone-800 placeholder-stone-400 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
-                  />
+                  <input name="name" value={form.name} onChange={handleInput} placeholder="Jane Smith" required className={inputClass} />
                 </div>
                 <div>
                   <label className="block text-xs text-stone-500 mb-1">WhatsApp number</label>
-                  <input
-                    name="phone" value={form.phone} onChange={handleInput}
-                    placeholder="+1 212 555 0123" type="tel"
-                    className="w-full px-3 py-2 border border-stone-200 rounded-lg text-sm text-stone-800 placeholder-stone-400 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
-                  />
+                  <input name="phone" value={form.phone} onChange={handleInput} placeholder="+1 212 555 0123" type="tel" className={inputClass} />
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   <div>
                     <label className="block text-xs text-stone-500 mb-1">District</label>
-                    <select name="district" value={form.district} onChange={handleInput}
-                      className="w-full px-3 py-2 border border-stone-200 rounded-lg text-sm text-stone-800 focus:outline-none focus:ring-2 focus:ring-green-500 transition">
+                    <select name="district" value={form.district} onChange={handleInput} className={inputClass}>
                       <option value="">Select…</option>
                       {['East Village', 'Lower East Side', "Hell's Kitchen", 'Midtown', 'Brooklyn', 'Harlem'].map(d => <option key={d}>{d}</option>)}
                     </select>
                   </div>
                   <div>
                     <label className="block text-xs text-stone-500 mb-1">Availability</label>
-                    <select name="availability" value={form.availability} onChange={handleInput}
-                      className="w-full px-3 py-2 border border-stone-200 rounded-lg text-sm text-stone-800 focus:outline-none focus:ring-2 focus:ring-green-500 transition">
+                    <select name="availability" value={form.availability} onChange={handleInput} className={inputClass}>
                       <option value="">Select…</option>
                       {['Evenings (5–9pm)', 'Weekends', 'Flexible'].map(a => <option key={a}>{a}</option>)}
                     </select>
@@ -127,26 +195,21 @@ export default function VolunteerPage() {
                 </div>
                 <div>
                   <label className="block text-xs text-stone-500 mb-1">Transport</label>
-                  <select name="transport" value={form.transport} onChange={handleInput}
-                    className="w-full px-3 py-2 border border-stone-200 rounded-lg text-sm text-stone-800 focus:outline-none focus:ring-2 focus:ring-green-500 transition">
+                  <select name="transport" value={form.transport} onChange={handleInput} className={inputClass}>
                     <option value="">Select…</option>
                     {['On foot', 'Bicycle / e-bike', 'Motorcycle', 'Car / van', 'Public transit'].map(t => <option key={t}>{t}</option>)}
                   </select>
                 </div>
 
-                {/* Pledge */}
                 <div className={`rounded-xl p-3 flex gap-2.5 items-start border transition ${pledgeError ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200'}`}>
-                  <input type="checkbox" id="pledge" checked={pledged}
-                    onChange={e => setPledged(e.target.checked)}
-                    className="mt-0.5 accent-green-600 flex-shrink-0" />
+                  <input type="checkbox" id="pledge" checked={pledged} onChange={e => setPledged(e.target.checked)} className="mt-0.5 accent-green-600 flex-shrink-0" />
                   <label htmlFor="pledge" className="text-xs text-green-900 leading-relaxed cursor-pointer">
                     <span className="font-semibold block mb-0.5">Volunteer pledge</span>
                     I commit to showing up for claimed pickups, handling food safely, and treating all recipients with dignity and respect.
                   </label>
                 </div>
 
-                <button onClick={handleSubmit}
-                  className="w-full py-2.5 bg-stone-800 text-white rounded-xl text-sm font-semibold hover:bg-stone-700 transition-colors">
+                <button onClick={handleSubmit} className="w-full py-2.5 bg-stone-800 text-white rounded-xl text-sm font-semibold hover:bg-stone-700 transition-colors">
                   Register as volunteer
                 </button>
               </div>
@@ -175,10 +238,7 @@ export default function VolunteerPage() {
                   {photos.map((f, i) => (
                     <div key={i} className="aspect-square rounded-lg overflow-hidden border border-stone-200 relative">
                       <img src={URL.createObjectURL(f)} alt="preview" className="w-full h-full object-cover" />
-                      <button onClick={() => removePhoto(i)}
-                        className="absolute top-1 right-1 w-4 h-4 bg-black/50 text-white rounded-full text-xs flex items-center justify-center">
-                        ✕
-                      </button>
+                      <button onClick={() => removePhoto(i)} className="absolute top-1 right-1 w-4 h-4 bg-black/50 text-white rounded-full text-xs flex items-center justify-center">✕</button>
                     </div>
                   ))}
                   {photos.length < 8 && (
@@ -190,81 +250,114 @@ export default function VolunteerPage() {
                 </div>
                 <button onClick={handleVerify} disabled={verifying}
                   className="w-full py-2.5 border border-green-600 text-green-700 rounded-xl text-sm font-medium hover:bg-green-50 transition disabled:opacity-50">
-                  {verifying ? 'Verifying…' : 'Verify with Claude Vision ↗'}
+                  {verifying ? 'Uploading & verifying…' : 'Verify with Claude Vision ↗'}
                 </button>
               </>
             )}
 
             {verifyResult && (
-              <div className="mt-3 p-3 bg-green-50 border border-green-200 rounded-xl text-xs text-green-800 leading-relaxed">
-                ✓ {verifyResult}
+              <div className={`mt-3 p-3 rounded-xl text-xs leading-relaxed border ${verifyResult.ok ? 'bg-green-50 border-green-200 text-green-800' : 'bg-red-50 border-red-200 text-red-800'}`}>
+                {verifyResult.ok ? '✓' : '✗'} {verifyResult.text}
               </div>
             )}
           </div>
         </div>
 
-        {/* ── RIGHT COLUMN ── */}
+        {/* RIGHT COLUMN */}
         <div className="space-y-4">
 
           {/* Listings card */}
           <div className="bg-white border border-stone-200 rounded-2xl p-5">
             <div className="flex items-center justify-between mb-4 pb-3 border-b border-stone-100">
               <p className="text-xs font-semibold text-stone-400 uppercase tracking-widest">Open listings near you</p>
-              <span className="text-xs font-mono text-green-600 font-medium">{LISTINGS.length - claimedCount} available</span>
+              <span className="text-xs text-green-600 font-medium">
+                {listings.filter(l => l.status === 'open').length} available
+              </span>
             </div>
 
+            {listings.length === 0 && (
+              <p className="text-xs text-stone-400 text-center py-4">Loading listings…</p>
+            )}
+
             <div className="space-y-3">
-              {LISTINGS.map(l => (
-                <div key={l.id} className={`border rounded-xl p-3.5 transition ${claimed[l.id] ? 'opacity-50 border-stone-100' : 'border-stone-200 hover:border-green-300 hover:bg-green-50/30'}`}>
-                  <div className="flex items-start gap-3 mb-2.5">
-                    <div className="w-9 h-9 rounded-lg bg-stone-100 flex items-center justify-center text-lg flex-shrink-0">
-                      {l.emoji}
+              {listings.map(l => {
+                const isClaimed = l.status === 'claimed'
+                const isCompleted = l.status === 'completed'
+                return (
+                  <div key={l.id} className={`border rounded-xl p-3.5 transition ${isCompleted || isClaimed ? 'opacity-60 border-stone-100' : 'border-stone-200 hover:border-green-300 hover:bg-green-50/30'}`}>
+                    <div className="flex items-start gap-3 mb-2.5">
+                      <div className="w-9 h-9 rounded-lg bg-stone-100 flex items-center justify-center text-lg flex-shrink-0">
+                        {FOOD_EMOJI[l.foodType] || '🍽️'}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-semibold text-stone-800 truncate">{l.restaurantName}</p>
+                        <p className="text-xs text-stone-500">{l.address}</p>
+                      </div>
+                      {isCompleted && (
+                        <span className={`flex-shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${l.aiVerified ? 'bg-green-100 text-green-800 border-green-300' : 'bg-stone-100 text-stone-500 border-stone-200'}`}>
+                          {l.aiVerified ? 'AI Verified ✓' : 'Completed'}
+                        </span>
+                      )}
                     </div>
-                    <div>
-                      <p className="text-sm font-semibold text-stone-800">{l.name} · {l.district}</p>
-                      <p className="text-xs text-stone-500">~{l.boxes} boxes · Pickup {l.window}</p>
+
+                    <div className="flex flex-wrap gap-1.5 mb-2.5">
+                      <span className="text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-800 border border-green-200">{l.foodType}</span>
+                      <span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200">{l.quantity} portions</span>
+                      {volunteerLocation && l.lat && l.lng && (
+                        <span className="text-xs px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 border border-blue-200">
+                          {haversineDistance(volunteerLocation.lat, volunteerLocation.lng, l.lat, l.lng).toFixed(1)} mi away
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center justify-between">
+                      <p className="text-xs text-stone-400">
+                        Pickup <span className="text-stone-600">{formatTime(l.pickupStart)}–{formatTime(l.pickupEnd)}</span>
+                      </p>
+                      {isCompleted || isClaimed
+                        ? <span className="text-xs font-medium text-green-600">{isCompleted ? 'Completed ✓' : 'Claimed ✓'}</span>
+                        : (
+                          <button onClick={() => handleClaim(l.id)}
+                            className="text-xs font-medium text-green-700 border border-green-600 px-3 py-1 rounded-full hover:bg-green-600 hover:text-white transition">
+                            Claim pickup
+                          </button>
+                        )
+                      }
                     </div>
                   </div>
-                  <div className="flex flex-wrap gap-1.5 mb-2.5">
-                    <span className="text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-800 border border-green-200">{l.type}</span>
-                    <span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200">{l.boxes} boxes</span>
-                    <span className="text-xs px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 border border-blue-200">{l.distance} away</span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <p className="text-xs text-stone-400">Expires <span className="text-red-500 font-medium">{l.expires}</span></p>
-                    {claimed[l.id]
-                      ? <span className="text-xs text-green-600 font-medium">Claimed ✓</span>
-                      : <button onClick={() => handleClaim(l.id)}
-                          className="text-xs font-medium text-green-700 border border-green-600 px-3 py-1 rounded-full hover:bg-green-600 hover:text-white transition">
-                          Claim pickup
-                        </button>
-                    }
-                  </div>
-                </div>
-              ))}
+                )
+              })}
             </div>
           </div>
 
-          {/* Claude route card — appears after 2+ claims */}
-          {claimedCount >= 2 && (
+          {/* Claude route card — appears after 2+ session claims */}
+          {sessionClaimedIds.length >= 2 && (
             <div className="bg-white border border-green-200 rounded-2xl p-5">
               <p className="text-xs font-semibold uppercase tracking-widest mb-4 pb-3 border-b border-stone-100">
                 <span className="text-green-600">Claude</span> · Optimized route
               </p>
-              <div className="space-y-2 mb-3">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-green-100 text-green-800">Stop 1</span>
-                  <span className="text-sm font-medium text-stone-800">Dim Sum Palace, Wan Chai</span>
+
+              {routeLoading && <p className="text-xs text-stone-400 py-2">Calculating best route…</p>}
+              {routeError && <p className="text-xs text-red-400 py-2">{routeError}</p>}
+
+              {!routeLoading && !routeError && orderedClaimedListings.length > 0 && (
+                <div className="space-y-2">
+                  {orderedClaimedListings.map((l, i) => (
+                    <div key={l.id} className="flex items-center gap-2">
+                      <span className={`text-xs font-medium px-2.5 py-1 rounded-full ${i === 0 ? 'bg-green-100 text-green-800' : i === 1 ? 'bg-amber-100 text-amber-800' : 'bg-blue-100 text-blue-800'}`}>
+                        Stop {i + 1}
+                      </span>
+                      <span className="text-sm font-medium text-stone-800 truncate">{l.restaurantName}, {l.address?.split(',')[1]?.trim() || l.address}</span>
+                    </div>
+                  ))}
+                  {routeReason && (
+                    <div className="bg-stone-50 rounded-xl p-3 text-xs text-stone-500 leading-relaxed mt-1">
+                      <span className="font-semibold text-stone-700 block mb-1">Claude's reasoning</span>
+                      {routeReason}
+                    </div>
+                  )}
                 </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-medium px-2.5 py-1 rounded-full bg-amber-100 text-amber-800">Stop 2</span>
-                  <span className="text-sm font-medium text-stone-800">Bento Garden, Central</span>
-                </div>
-              </div>
-              <div className="bg-stone-50 rounded-xl p-3 text-xs text-stone-500 leading-relaxed">
-                <span className="font-semibold text-stone-700 block mb-1">Claude's reasoning</span>
-                Wan Chai expires at 7 PM — do it first. Central's window runs until 8 PM. Skip TST unless another volunteer claims it.
-              </div>
+              )}
             </div>
           )}
 
