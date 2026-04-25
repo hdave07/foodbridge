@@ -186,18 +186,30 @@ export default function VolunteerPage() {
     if (!photos?.[0]) return
     setVerifyingId(listing.id)
     try {
-      const storageRef = ref(storage, `deliveries/${Date.now()}_${photos[0].name}`)
-      await uploadBytes(storageRef, photos[0])
-      const photoUrl = await getDownloadURL(storageRef)
+      // Storage upload is best-effort — don't let it block the Claude check
+      let photoUrl = null
+      try {
+        const storageRef = ref(storage, `deliveries/${Date.now()}_${photos[0].name}`)
+        await uploadBytes(storageRef, photos[0])
+        photoUrl = await getDownloadURL(storageRef)
+      } catch (storageErr) {
+        console.warn('Storage upload failed, continuing with verification:', storageErr)
+      }
 
       const base64 = await toBase64(photos[0])
-      const { verified, flagged, reason } = await verifyPhoto(base64)
+      const mediaType = photos[0].type || 'image/jpeg'
+      const { verified, flagged, reason } = await verifyPhoto(base64, mediaType)
 
       if (flagged) setFlagCount(prev => prev + 1)
 
       setListingResults(prev => ({
         ...prev,
-        [listing.id]: { ok: verified, text: verified ? `Verified — ${reason}` : `Not verified — ${reason}`, photoUrl, submitted: true },
+        [listing.id]: {
+          ok: verified,
+          text: verified ? `Verified — ${reason}` : `Not verified — ${reason}`,
+          photoUrl,
+          submitted: true,
+        },
       }))
     } catch (err) {
       setListingResults(prev => ({

@@ -49,7 +49,7 @@ Respond with JSON only, no markdown:
   return JSON.parse(clean)
 }
 
-export async function verifyPhoto(base64Image) {
+export async function verifyPhoto(base64Image, mediaType = 'image/jpeg') {
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -67,7 +67,7 @@ export async function verifyPhoto(base64Image) {
           content: [
             {
               type: "image",
-              source: { type: "base64", media_type: "image/jpeg", data: base64Image }
+              source: { type: "base64", media_type: mediaType, data: base64Image }
             },
             {
               type: "text",
