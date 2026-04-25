@@ -7,6 +7,20 @@ import { getRouteOrder, verifyPhoto } from '../claude'
 
 const FOOD_EMOJI = { 'Noodles':'🍜', 'Cooked meals':'🍱', 'Bread & bakery':'🥖', 'Dim sum':'🥟', 'Drinks':'🧃' }
 
+const TRANSPORT_SPEEDS_MPH = {
+  'On foot': 3,
+  'Bicycle / e-bike': 10,
+  'Motorcycle': 20,
+  'Car / van': 20,
+  'Public transit': 10,
+}
+
+function estimateMinutes(distMi, transport) {
+  const speed = TRANSPORT_SPEEDS_MPH[transport]
+  if (!speed || !distMi) return null
+  return Math.round((distMi / speed) * 60)
+}
+
 const BOROUGH_COORDS = {
   'Manhattan':     { lat: 40.7831, lng: -73.9712 },
   'Brooklyn':      { lat: 40.6782, lng: -73.9442 },
@@ -23,7 +37,7 @@ function formatTime(val) {
 }
 
 export default function VolunteerPage() {
-  const [form, setForm] = useState({ name: '', phone: '' })
+  const [form, setForm] = useState({ name: '', phone: '', transport: '' })
   const [locStatus, setLocStatus] = useState('idle') // idle | loading | found | error
   const [pledged, setPledged] = useState(false)
   const [pledgeError, setPledgeError] = useState(false)
@@ -240,6 +254,14 @@ export default function VolunteerPage() {
                 </div>
 
                 <div>
+                  <label className="block text-xs text-stone-500 mb-1">Transport</label>
+                  <select name="transport" value={form.transport} onChange={handleInput} className={inputClass}>
+                    <option value="">Select…</option>
+                    {Object.keys(TRANSPORT_SPEEDS_MPH).map(t => <option key={t}>{t}</option>)}
+                  </select>
+                </div>
+
+                <div>
                   <label className="block text-xs text-stone-500 mb-1.5">Your location</label>
                   <button
                     type="button"
@@ -400,6 +422,14 @@ export default function VolunteerPage() {
                           {distMi.toFixed(1)} mi
                         </span>
                       )}
+                      {(() => {
+                        const mins = estimateMinutes(distMi, form.transport)
+                        return mins !== null ? (
+                          <span className="text-xs px-2 py-0.5 rounded-full bg-purple-100 text-purple-800 border border-purple-200">
+                            ~{mins} min
+                          </span>
+                        ) : null
+                      })()}
                     </div>
 
                     <div className="flex items-center justify-between">
