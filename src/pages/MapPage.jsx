@@ -71,12 +71,20 @@ export default function MapPage() {
 
   useEffect(() => {
     if (mapRef.current) return
-    mapRef.current = new mapboxgl.Map({
-      container: mapContainer.current,
-      style: 'mapbox://styles/mapbox/light-v11',
-      center: [-74.006, 40.7128],
-      zoom: 12,
-    })
+    console.log('[Map] token:', mapboxgl.accessToken?.slice(0, 20))
+    console.log('[Map] container:', mapContainer.current)
+    if (!mapContainer.current) return
+    try {
+      mapRef.current = new mapboxgl.Map({
+        container: mapContainer.current,
+        style: 'mapbox://styles/mapbox/light-v11',
+        center: [-74.006, 40.7128],
+        zoom: 12,
+      })
+      mapRef.current.on('error', e => console.error('[Map] error:', e))
+    } catch (e) {
+      console.error('[Map] init failed:', e)
+    }
     return () => {
       mapRef.current?.remove()
       mapRef.current = null
@@ -116,7 +124,7 @@ export default function MapPage() {
     <div style={{ height: 'calc(100vh - 56px)' }} className="flex">
       {/* Map */}
       <div className="flex-1 relative bg-stone-100">
-        <div ref={mapContainer} className="absolute inset-0" />
+        <div ref={mapContainer} style={{ position: 'absolute', top: 0, right: 0, bottom: 0, left: 0 }} />
 
         {/* Legend */}
         <div className="absolute bottom-4 left-4 bg-white rounded-xl shadow border border-stone-200 px-4 py-3 text-xs space-y-1.5 z-10">
