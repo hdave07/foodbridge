@@ -88,6 +88,8 @@ flagged: true if the image appears fraudulent, irrelevant, or deliberately misle
       })
     })
     const data = await response.json()
+    if (data.error) throw new Error(data.error.message)
     const text = data.content[0].text
-    return JSON.parse(text)
+    const clean = text.replace(/```json\n?|\n?```/g, '').trim()
+    return JSON.parse(clean)
   }

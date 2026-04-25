@@ -4,7 +4,7 @@ import { collection, addDoc, serverTimestamp } from 'firebase/firestore'
 
 const FOOD_TYPES = [
   { id: 'cooked', label: 'Cooked meals', emoji: '🍱' },
-  { id: 'noodles', label: 'Rice & noodles', emoji: '🍜' },
+  { id: 'noodles', label: 'Noodles', emoji: '🍜' },
   { id: 'bakery', label: 'Bread & bakery', emoji: '🍞' },
   { id: 'dimsum', label: 'Dim sum', emoji: '🥟' },
   { id: 'drinks', label: 'Drinks', emoji: '🧃' },
@@ -27,15 +27,28 @@ export default function RestaurantPage() {
     setForm({ ...form, [e.target.name]: e.target.value })
   }
 
+  const geocode = async (address) => {
+    const token = import.meta.env.VITE_MAPBOX_TOKEN
+    const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(address)}.json?access_token=${token}&limit=1`
+    const res = await fetch(url)
+    const data = await res.json()
+    if (data.features?.length > 0) {
+      const [lng, lat] = data.features[0].center
+      return { lat, lng }
+    }
+    return { lat: 0, lng: 0 }
+  }
+
   const handleSubmit = async (e) => {
     e.preventDefault()
+    const { lat, lng } = await geocode(form.address)
     await addDoc(collection(db, 'listings'), {
       ...form,
       quantity: Number(form.quantity),
       foodType: FOOD_TYPES.find(t => t.id === selectedFood)?.label || selectedFood,
       status: 'open',
-      lat: 0,
-      lng: 0,
+      lat,
+      lng,
       claimedBy: null,
       photoUrl: null,
       aiVerified: null,

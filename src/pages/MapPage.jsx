@@ -34,6 +34,7 @@ function toTimeString(val) {
 }
 
 function getPinStyle(status, pickupEnd) {
+  if (status === 'completed') return { bg: 'bg-stone-400', label: 'Completed', color: '#9ca3af' }
   if (status === 'claimed') return { bg: 'bg-stone-400', label: 'Claimed', color: '#9ca3af' }
   if (!pickupEnd || typeof pickupEnd !== 'string') return { bg: 'bg-green-600', label: 'Available', color: '#16a34a' }
   const [h, m] = pickupEnd.split(':').map(Number)
@@ -71,8 +72,6 @@ export default function MapPage() {
 
   useEffect(() => {
     if (mapRef.current) return
-    console.log('[Map] token:', mapboxgl.accessToken?.slice(0, 20))
-    console.log('[Map] container:', mapContainer.current)
     if (!mapContainer.current) return
     try {
       mapRef.current = new mapboxgl.Map({
@@ -115,8 +114,13 @@ export default function MapPage() {
     }
   }, [listings])
 
+  useEffect(() => {
+    if (!selected || !mapRef.current || !selected.lat || !selected.lng) return
+    mapRef.current.flyTo({ center: [selected.lng, selected.lat], zoom: 15, duration: 800 })
+  }, [selected])
+
   const handleClaim = async (id) => {
-    await updateDoc(doc(db, 'listings', id), { status: 'claimed', claimedBy: 'volunteer-id' })
+    await updateDoc(doc(db, 'listings', id), { status: 'claimed', claimedBy: 'map-volunteer' })
     setSelected(prev => prev ? { ...prev, status: 'claimed' } : null)
   }
 
