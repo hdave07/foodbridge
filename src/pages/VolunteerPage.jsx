@@ -39,6 +39,10 @@ export default function VolunteerPage() {
   const [verifying, setVerifying] = useState(false)
   const [verifyResult, setVerifyResult] = useState(null)
 
+  const [flagCount, setFlagCount] = useState(0)
+  const FLAG_THRESHOLD = 3
+  const isLocked = flagCount >= FLAG_THRESHOLD
+
   // Listings claimed this session that are still in 'claimed' status in Firestore
   const sessionClaimedListings = listings.filter(l => claimed[l.id] && l.status === 'claimed')
   const sessionClaimedIds = sessionClaimedListings.map(l => l.id)
@@ -112,7 +116,11 @@ export default function VolunteerPage() {
 
       // Verify with Claude Vision
       const base64 = await toBase64(photos[0])
-      const { verified, reason } = await verifyPhoto(base64)
+      const { verified, flagged, reason } = await verifyPhoto(base64)
+
+      if (!verified) {
+        setFlagCount(prev => prev + 1)
+      }
 
       // Mark the first session-claimed listing as completed
       const targetId = sessionClaimedIds[0]
@@ -121,6 +129,7 @@ export default function VolunteerPage() {
           status: 'completed',
           photoUrl,
           aiVerified: verified,
+          aiFlagged: flagged ?? false,
           aiReason: reason,
         })
       }
@@ -275,6 +284,17 @@ export default function VolunteerPage() {
               </span>
             </div>
 
+            {isLocked && (
+              <div className="mb-3 p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-800 font-medium">
+                Account locked — {FLAG_THRESHOLD} failed verifications. Contact support to appeal.
+              </div>
+            )}
+            {!isLocked && flagCount > 0 && (
+              <div className="mb-3 p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800">
+                Warning: {flagCount}/{FLAG_THRESHOLD} verification failures. Account locks at {FLAG_THRESHOLD}.
+              </div>
+            )}
+
             {listings.length === 0 && (
               <p className="text-xs text-stone-400 text-center py-4">Loading listings…</p>
             )}
@@ -316,12 +336,14 @@ export default function VolunteerPage() {
                       </p>
                       {isCompleted || isClaimed
                         ? <span className="text-xs font-medium text-green-600">{isCompleted ? 'Completed ✓' : 'Claimed ✓'}</span>
-                        : (
-                          <button onClick={() => handleClaim(l.id)}
-                            className="text-xs font-medium text-green-700 border border-green-600 px-3 py-1 rounded-full hover:bg-green-600 hover:text-white transition">
-                            Claim pickup
-                          </button>
-                        )
+                        : isLocked
+                          ? <span className="text-xs font-medium text-red-400">Account locked</span>
+                          : (
+                            <button onClick={() => handleClaim(l.id)}
+                              className="text-xs font-medium text-green-700 border border-green-600 px-3 py-1 rounded-full hover:bg-green-600 hover:text-white transition">
+                              Claim pickup
+                            </button>
+                          )
                       }
                     </div>
                   </div>

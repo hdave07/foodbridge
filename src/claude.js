@@ -71,7 +71,16 @@ Respond with JSON only, no markdown:
               },
               {
                 type: "text",
-                text: `This photo was submitted by a food rescue volunteer as proof of distribution to homeless individuals. Does this image plausibly show food being shared in a communal or public context? Respond with JSON only: { "verified": true/false, "reason": "one sentence" }`
+                text: `This photo was submitted by a food rescue volunteer as proof of delivery. Does it plausibly show food being distributed in a communal or public setting?
+
+Respond with JSON only:
+{
+  "verified": true/false,
+  "flagged": true/false,
+  "reason": "one sentence"
+}
+verified: true if the photo plausibly shows food distribution.
+flagged: true if the image appears fraudulent, irrelevant, or deliberately misleading (e.g. blank wall, stock photo, repeated submission).`
               }
             ]
           }
