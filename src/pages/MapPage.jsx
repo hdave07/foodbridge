@@ -6,6 +6,7 @@ mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN
 
 import { db } from '../firebase'
 import { collection, query, onSnapshot, doc, updateDoc } from 'firebase/firestore'
+import { assignNearestShelter } from '../geo'
 
 const SEED_LISTINGS = [
   { id: '1', restaurantName: "Xi'an Famous Foods", address: '81 St Marks Pl, East Village',
@@ -119,8 +120,18 @@ export default function MapPage() {
     mapRef.current.flyTo({ center: [selected.lng, selected.lat], zoom: 15, duration: 800 })
   }, [selected])
 
-  const handleClaim = async (id) => {
-    await updateDoc(doc(db, 'listings', id), { status: 'claimed', claimedBy: 'map-volunteer' })
+  const handleClaim = async (listing) => {
+    const shelter = assignNearestShelter(listing)
+    await updateDoc(doc(db, 'listings', listing.id), {
+      status: 'claimed',
+      claimedBy: 'map-volunteer',
+      dropOffId: shelter.id,
+      dropOffName: shelter.name,
+      dropOffAddress: shelter.address,
+      dropOffLat: shelter.lat,
+      dropOffLng: shelter.lng,
+      dropOffEIN: shelter.ein,
+    })
     setSelected(prev => prev ? { ...prev, status: 'claimed' } : null)
   }
 
@@ -163,7 +174,7 @@ export default function MapPage() {
             <div className="p-5 space-y-2">
               {selected.status === 'open' ? (
                 <button
-                  onClick={() => handleClaim(selected.id)}
+                  onClick={() => handleClaim(selected)}
                   className="w-full py-3 bg-stone-800 text-white rounded-xl text-sm font-semibold hover:bg-stone-700 transition-colors"
                 >
                   Claim this pickup

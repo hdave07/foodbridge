@@ -48,7 +48,7 @@ export default function VolunteerPage() {
 
   const sessionClaimedListings = listings.filter(l => claimed[l.id] && l.status === 'claimed')
   const sessionClaimedIds = sessionClaimedListings.map(l => l.id)
-  const verifyTarget = sessionClaimedListings[0] || null
+  const verifyTarget = sessionClaimedListings.at(-1) || null
 
   const sortedListings = volunteerLocation
     ? [...listings].sort((a, b) => {
@@ -163,7 +163,7 @@ export default function VolunteerPage() {
       const base64 = await toBase64(photos[0])
       const { verified, flagged, reason } = await verifyPhoto(base64)
 
-      if (!verified) setFlagCount(prev => prev + 1)
+      if (flagged) setFlagCount(prev => prev + 1)
 
       if (verifyTarget) {
         await updateDoc(doc(db, 'listings', verifyTarget.id), {
